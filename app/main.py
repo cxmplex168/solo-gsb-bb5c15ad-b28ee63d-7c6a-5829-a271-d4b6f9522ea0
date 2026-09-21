@@ -1,8 +1,11 @@
-"""交叉实验顺序平衡 API。
+"""交叉实验顺序平衡 + 按周期受控揭盲 API。
 
 使用 Williams 平衡拉丁方为受试者分配条件顺序，保证：
 * 每个条件在每个位置上出现次数相等；
 * 每个有向相邻条件对出现次数相等。
+
+创建 / 详情接口不返回完整条件序列；每个受试者的条件通过推进接口
+按周期逐个揭盲，进度与幂等结果在 SQLite 事务中原子持久化。
 """
 
 from __future__ import annotations
@@ -15,21 +18,28 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 
 from . import db
-from .schemas import ExperimentCreate, ExperimentOut, ExperimentSummary
+from .schemas import (
+    AdvanceOut,
+    AdvanceRequest,
+    ExperimentCreate,
+    ExperimentOut,
+    ExperimentSummary,
+    ProgressOut,
+)
 from .williams import group_size, williams_sequences
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 容器 / 进程启动时建表
+    # 容器 / 进程启动时建表；已有数据库自动补齐缺失表结构
     db.init_db()
     yield
 
 
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
-    description="基于 Williams 平衡拉丁方的交叉实验顺序分配服务",
-    version="1.0.0",
+    description="基于 Williams 平衡拉丁方的交叉实验顺序分配服务（按周期受控揭盲）",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -43,7 +53,7 @@ def health() -> dict[str, str]:
     "/experiments",
     status_code=201,
     response_model=ExperimentOut,
-    summary="创建实验并生成分配结果",
+    summary="创建实验并生成分配（不返回条件序列）",
 )
 def create_experiment(payload: ExperimentCreate) -> dict:
     conditions = payload.conditions
@@ -114,14 +124,16 @@ def create_experiment(payload: ExperimentCreate) -> dict:
         experiment_id, conditions, payload.seed, size, created_at, assignments
     )
 
+    # 受控揭盲：完整序列只入库，不随响应返回
     return {
         "experiment_id": experiment_id,
         "conditions": conditions,
         "seed": payload.seed,
         "group_size": size,
         "num_subjects": count,
+        "num_periods": n,
         "created_at": created_at,
-        "assignments": assignments,
+        "subjects": subject_ids,
     }
 
 
@@ -137,10 +149,48 @@ def list_experiments() -> list[dict]:
 @app.get(
     "/experiments/{experiment_id}",
     response_model=ExperimentOut,
-    summary="查询实验分配结果",
+    summary="查询实验详情（不返回条件序列）",
 )
 def get_experiment(experiment_id: str) -> dict:
     experiment = db.get_experiment(experiment_id)
     if experiment is None:
         raise HTTPException(status_code=404, detail="experiment not found")
     return experiment
+
+
+@app.post(
+    "/experiments/{experiment_id}/advance",
+    response_model=AdvanceOut,
+    summary="按周期揭盲并原子推进（幂等）",
+)
+def advance_subject(experiment_id: str, payload: AdvanceRequest) -> dict:
+    """仅当 ``expected_period`` 等于该受试者下一待揭盲周期时，
+    返回当前周期条件并原子推进；相同 ``request_id`` 重试返回首次结果；
+    并发 / 过期周期返回 409，且不揭露任何条件。"""
+    revealed_at = datetime.now(timezone.utc).isoformat()
+    outcome, body = db.advance_subject(
+        experiment_id,
+        payload.subject_id,
+        payload.expected_period,
+        payload.request_id,
+        revealed_at,
+    )
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail=body["message"])
+    if outcome == "conflict":
+        raise HTTPException(status_code=409, detail=body)
+    return body
+
+
+@app.get(
+    "/experiments/{experiment_id}/subjects/{subject_id}/progress",
+    response_model=ProgressOut,
+    summary="查询受试者揭盲进度（只含已揭盲记录）",
+)
+def get_subject_progress(experiment_id: str, subject_id: str) -> dict:
+    progress, error = db.get_subject_progress(experiment_id, subject_id)
+    if error == "experiment":
+        raise HTTPException(status_code=404, detail="experiment not found")
+    if error == "subject":
+        raise HTTPException(status_code=404, detail="subject not found")
+    return progress
